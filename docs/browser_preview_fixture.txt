@@ -1,0 +1,557 @@
+import 'dart:math' as math;
+import 'dart:ui' as ui;
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:intl/intl.dart' show NumberFormat, DateFormat;
+// Native services are deliberately replaced for this browser fixture preview.
+class SharedPreferences {
+  final values = <String,String>{};
+  String? getString(String key) => values[key];
+  Future<bool> setString(String key, String value) async { values[key]=value; return true; }
+}
+class ExpenseRepository {
+  final records = <Expense>[];
+  Future<List<Expense>> list() async => List.of(records)..sort((a,b)=>b.date.compareTo(a.date));
+  Future<void> close() async {}
+  Future<void> save(Expense e) async { records.removeWhere((v)=>v.id==e.id); records.add(e); print('FIXTURE_SAVE: ${e.amount}'); }
+  Future<void> delete(Expense e) async { records.remove(e); }
+}
+class StoredReceipt { const StoredReceipt(this.image,this.thumbnail); final String image,thumbnail; }
+class ReceiptStorage {
+  Future<StoredReceipt> persist(String path) async => throw UnsupportedError('Android only');
+  Future<void> cleanup(StoredReceipt s) async {}
+}
+class OcrLine { const OcrLine(this.text,this.bounds); final String text; final ui.Rect bounds; }
+class OcrResult {
+  const OcrResult({required this.text,required this.lines,required this.size,required this.elapsed});
+  final String text; final List<OcrLine> lines; final ui.Size size; final Duration elapsed;
+}
+class CaptureScreen extends StatelessWidget {
+  const CaptureScreen({super.key});
+  @override Widget build(BuildContext c) => const Scaffold(body:Center(child:Text('Camera / OCR: Android device required')));
+}
+class ReceiptPreview extends StatelessWidget {
+  const ReceiptPreview({super.key,required this.path,this.ocr,this.showBoxes=true});
+  final String path; final OcrResult? ocr; final bool showBoxes;
+  @override Widget build(BuildContext c)=>const SizedBox(height:160,child:Center(child:Text('Android receipt preview')));
+}
+
+enum ExpenseCategory { food, study, travel, gear, entertainment }
+
+extension CategoryLabel on ExpenseCategory {
+  String get label => ['Ăn uống', 'Học tập', 'Di chuyển', 'Đồ dùng', 'Giải trí'][index];
+}
+
+class Expense {
+  const Expense({this.id, required this.merchant, required this.amount,
+    required this.date, required this.category, this.imagePath,
+    this.thumbnailPath, this.rawText = '', this.note = ''});
+  final int? id;
+  final String merchant;
+  final int amount; // Integer VND avoids floating point money errors.
+  final DateTime date;
+  final ExpenseCategory category;
+  final String? imagePath, thumbnailPath;
+  final String rawText, note;
+
+  Map<String, Object?> toMap() => {
+    if (id != null) 'id': id, 'merchant': merchant, 'amount': amount,
+    'date': DateTime(date.year, date.month, date.day).toIso8601String(),
+    'category': category.name, 'image_path': imagePath,
+    'thumbnail_path': thumbnailPath, 'raw_text': rawText, 'note': note,
+  };
+  factory Expense.fromMap(Map<String, Object?> m) => Expense(
+    id: m['id'] as int, merchant: m['merchant'] as String,
+    amount: m['amount'] as int, date: DateTime.parse(m['date'] as String),
+    category: ExpenseCategory.values.byName(m['category'] as String),
+    imagePath: m['image_path'] as String?, thumbnailPath: m['thumbnail_path'] as String?,
+    rawText: m['raw_text'] as String, note: m['note'] as String,
+  );
+}
+
+String money(num value) => '${NumberFormat.decimalPattern('vi').format(value)} đ';
+String shortDate(DateTime d) => DateFormat('dd/MM/yyyy').format(d);
+DateTime dayOnly(DateTime d) => DateTime(d.year, d.month, d.day);
+
+ThemeData appTheme(Brightness brightness) {
+  final dark = brightness == Brightness.dark;
+  final scheme = ColorScheme.fromSeed(seedColor: const Color(0xff137c66), brightness: brightness);
+  return ThemeData(useMaterial3: true, colorScheme: scheme,
+    scaffoldBackgroundColor: dark ? const Color(0xff101c21) : const Color(0xfff4f7f6),
+    appBarTheme: const AppBarTheme(centerTitle: false, backgroundColor: Colors.transparent, elevation: 0),
+    cardTheme: CardThemeData(elevation: 0, margin: EdgeInsets.zero,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      color: dark ? const Color(0xff1b2b31) : Colors.white),
+    inputDecorationTheme: InputDecorationTheme(filled: true,
+      border: OutlineInputBorder(borderRadius: BorderRadius.circular(16), borderSide: BorderSide.none)),
+    filledButtonTheme: FilledButtonThemeData(style: FilledButton.styleFrom(
+      padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)))),
+  );
+}
+
+class AmountCandidate {
+  const AmountCandidate(this.amount, this.line, this.score);
+  final int amount;
+  final String line;
+  final int score;
+}
+
+class ParsedReceipt {
+  const ParsedReceipt({required this.merchant, this.amount, this.date,
+    required this.candidates, required this.warnings});
+  final String merchant;
+  final int? amount;
+  final DateTime? date;
+  final List<AmountCandidate> candidates;
+  final List<String> warnings;
+}
+
+class ReceiptParser {
+  static String normalize(String value) {
+    var result = value.toLowerCase();
+    const groups = {
+      'a': 'àáạảãâầấậẩẫăằắặẳẵ', 'e': 'èéẹẻẽêềếệểễ',
+      'i': 'ìíịỉĩ', 'o': 'òóọỏõôồốộổỗơờớợởỡ',
+      'u': 'ùúụủũưừứựửữ', 'y': 'ỳýỵỷỹ', 'd': 'đ',
+    };
+    for (final entry in groups.entries) {
+      for (final char in entry.value.split('')) { result = result.replaceAll(char, entry.key); }
+    }
+    return result;
+  }
+
+  // VND only: grouping separators accepted; decimal currencies rejected.
+  static int? parseVnd(String value) {
+    final cleaned = value.trim().replaceAll(RegExp(r'vnd|vnđ|đ|₫', caseSensitive: false), '').trim();
+    if (!RegExp(r'^(?:\d{1,3}(?:[., ]\d{3})+|\d+)$').hasMatch(cleaned)) { return null; }
+    final n = int.tryParse(cleaned.replaceAll(RegExp(r'[., ]'), ''));
+    return n != null && n > 0 && n <= 1000000000 ? n : null;
+  }
+
+  ParsedReceipt parse(String raw) {
+    final lines = raw.split(RegExp(r'[\r\n]+')).map((s) => s.trim()).where((s) => s.isNotEmpty).toList();
+    final candidates = <AmountCandidate>[];
+    final amounts = RegExp(r'(?<![\d/:-])(?:\d{1,3}(?:[., ]\d{3})+|\d{4,})(?![\d/:-])(?:\s*(?:VND|VNĐ|đ|₫))?', caseSensitive: false);
+    final total = RegExp(r'\b(?:grand total|total due|amount due|thanh toan|tong cong|tong tien|total)\b');
+    final excluded = RegExp(r'\b(?:subtotal|sub total|tam tinh|tien khach|khach dua|tien thoi|change|cash|tender|vat|tax|giam gia|discount)\b');
+    final metadata = RegExp(r'\b(?:tel|phone|hotline|mst|tax id|ma so thue|invoice|hoa don|so hd|account|tai khoan)\b');
+    for (var i = 0; i < lines.length; i++) {
+      final line = lines[i];
+      final norm = normalize(line);
+      if (excluded.hasMatch(norm) || metadata.hasMatch(norm) || RegExp(r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}').hasMatch(line)) { continue; }
+      final matches = amounts.allMatches(line).toList();
+      if (matches.isEmpty) { continue; }
+      final amount = parseVnd(matches.last.group(0)!);
+      if (amount == null) { continue; }
+      var score = total.hasMatch(norm) ? 100 : 10;
+      if (i > 0 && total.hasMatch(normalize(lines[i - 1])) && !excluded.hasMatch(normalize(lines[i - 1]))) { score = 90; }
+      if (RegExp(r'vnd|vnđ|đ|₫', caseSensitive: false).hasMatch(line)) { score += 15; }
+      candidates.add(AmountCandidate(amount, line, score));
+    }
+    candidates.sort((a, b) { final s = b.score.compareTo(a.score); return s != 0 ? s : b.amount.compareTo(a.amount); });
+    DateTime? date;
+    for (final m in RegExp(r'\b(\d{1,2})[/\-.](\d{1,2})[/\-.](\d{4})\b').allMatches(raw)) {
+      final d = int.parse(m[1]!), month = int.parse(m[2]!), y = int.parse(m[3]!);
+      final v = DateTime(y, month, d);
+      if (y >= 2000 && y <= 2100 && v.day == d && v.month == month) { date = v; break; }
+    }
+    final names = lines.take(8).where((s) {
+      final n = normalize(s);
+      return RegExp(r'[a-z]').hasMatch(n) && !metadata.hasMatch(n) &&
+        !RegExp(r'\b(?:receipt|hoa don|ngay|date|dia chi|address|thank|cam on|cashier)\b').hasMatch(n) &&
+        !RegExp(r'\d{3,}').hasMatch(n) && !total.hasMatch(n);
+    }).toList();
+    return ParsedReceipt(merchant: names.isEmpty ? '' : names.first,
+      amount: candidates.isEmpty ? null : candidates.first.amount, date: date,
+      candidates: candidates, warnings: [
+        if (candidates.isEmpty) 'Không tìm thấy số tiền. Vui lòng nhập thủ công.',
+        if (candidates.isNotEmpty && candidates.first.score < 90) 'Chưa tìm được dòng tổng tiền rõ ràng; hãy đối chiếu ảnh.',
+        if (date == null) 'Không tìm được ngày hợp lệ. Hãy chọn ngày trên hóa đơn.',
+        if (names.isEmpty) 'Chưa nhận diện được tên cửa hàng.',
+      ]);
+  }
+}
+
+final preferencesProvider = Provider<SharedPreferences>((ref) => throw StateError('Preferences not initialized'));
+final repositoryProvider = Provider<ExpenseRepository>((ref) {
+  final repo = ExpenseRepository();
+  ref.onDispose(repo.close);
+  return repo;
+});
+final expensesProvider = AsyncNotifierProvider<ExpenseNotifier, List<Expense>>(ExpenseNotifier.new);
+class ExpenseNotifier extends AsyncNotifier<List<Expense>> {
+  @override
+  Future<List<Expense>> build() => ref.watch(repositoryProvider).list();
+  Future<void> refresh() async { state = AsyncData(await ref.read(repositoryProvider).list()); }
+  Future<void> save(Expense e) async {
+    await ref.read(repositoryProvider).save(e);
+    await refresh();
+  }
+  Future<void> delete(Expense e) async {
+    await ref.read(repositoryProvider).delete(e);
+    await refresh();
+  }
+}
+final themeProvider = NotifierProvider<ThemeNotifier, ThemeMode>(ThemeNotifier.new);
+class ThemeNotifier extends Notifier<ThemeMode> {
+  @override
+  ThemeMode build() => switch(ref.read(preferencesProvider).getString('theme')) {
+    'dark' => ThemeMode.dark, 'light' => ThemeMode.light, _ => ThemeMode.system,
+  };
+  Future<void> toggle(bool isDark) async {
+    state = isDark ? ThemeMode.light : ThemeMode.dark;
+    await ref.read(preferencesProvider).setString('theme', state.name);
+  }
+}
+
+const categoryColors = [Color(0xff159d82), Color(0xff6587dc), Color(0xffe3a444), Color(0xff9e78d5), Color(0xffde7d8e)];
+const categoryIcons = [Icons.restaurant_rounded, Icons.school_rounded, Icons.directions_bus_rounded, Icons.shopping_bag_rounded, Icons.movie_rounded];
+
+class ExpenseCharts extends StatefulWidget {
+  const ExpenseCharts({super.key, required this.expenses});
+  final List<Expense> expenses;
+  @override
+  State<ExpenseCharts> createState() => _ExpenseChartsState();
+}
+class _ExpenseChartsState extends State<ExpenseCharts> {
+  int? selectedCategory, selectedDay;
+  @override
+  Widget build(BuildContext context) {
+    final values = List<double>.filled(5, 0);
+    final days = List<double>.filled(7, 0);
+    final today = dayOnly(DateTime.now());
+    final start = DateTime(today.year, today.month, today.day - 6);
+    for (final e in widget.expenses) {
+      values[e.category.index] += e.amount;
+      final diff = dayOnly(e.date).difference(start).inDays;
+      if (diff >= 0 && diff < 7) { days[diff] += e.amount; }
+    }
+    final total = values.fold(0.0, (a, b) => a + b);
+    final text = Theme.of(context).colorScheme.onSurface;
+    final key = ValueKey(widget.expenses.map((e) => '${e.id}:${e.amount}:${e.category}:${e.date}').join('|'));
+    return TweenAnimationBuilder<double>(key: key, tween: Tween(begin: 0, end: 1), duration: const Duration(milliseconds: 850),
+      curve: Curves.easeOutCubic, builder: (context, progress, _) => Column(children: [
+        Card(child: Padding(padding: const EdgeInsets.all(20), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('Chi tiêu theo danh mục', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 16),
+          Center(child: SizedBox(width: 230, height: 230, child: GestureDetector(
+            onTapUp: (event) {
+              final d = event.localPosition - const Offset(115, 115);
+              if (d.distance < 77 || d.distance > 108 || total == 0) { return; }
+              var angle = math.atan2(d.dy, d.dx) + math.pi / 2;
+              if (angle < 0) { angle += math.pi * 2; }
+              var end = 0.0;
+              for (var i = 0; i < values.length; i++) {
+                end += values[i] / total * math.pi * 2;
+                if (angle <= end) { setState(() => selectedCategory = selectedCategory == i ? null : i); break; }
+              }
+            }, child: CustomPaint(painter: DonutPainter(values, progress, selectedCategory,
+              Theme.of(context).colorScheme.surfaceContainerHighest), child: Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Text(selectedCategory == null ? 'TỔNG CHI TIÊU' : ExpenseCategory.values[selectedCategory!].label.toUpperCase(),
+                  style: Theme.of(context).textTheme.labelSmall),
+                const SizedBox(height: 8),
+                Text(money(selectedCategory == null ? total : values[selectedCategory!]), style: Theme.of(context).textTheme.titleMedium),
+              ])))))),
+          Wrap(spacing: 6, runSpacing: 6, children: List.generate(5, (i) => ChoiceChip(
+            selected: selectedCategory == i,
+            onSelected: (_) => setState(() => selectedCategory = selectedCategory == i ? null : i),
+            avatar: CircleAvatar(radius: 5, backgroundColor: categoryColors[i]),
+            label: Text('${ExpenseCategory.values[i].label} ${total == 0 ? 0 : (values[i]/total*100).round()}%'),
+          ))),
+          if (total == 0) const Padding(padding: EdgeInsets.only(top: 12), child: Text('Thêm giao dịch để xem phân bố chi tiêu.')),
+        ]))),
+        const SizedBox(height: 16),
+        Card(child: Padding(padding: const EdgeInsets.all(20), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Text('7 ngày gần đây', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          Text(selectedDay == null ? 'Chạm vào cột để xem số tiền' : '${shortDate(DateTime(start.year, start.month, start.day + selectedDay!))}: ${money(days[selectedDay!])}'),
+          const SizedBox(height: 18),
+          SizedBox(height: 190, width: double.infinity, child: LayoutBuilder(builder: (context, box) => GestureDetector(
+            onTapUp: (event) => setState(() => selectedDay = (event.localPosition.dx / box.maxWidth * 7).floor().clamp(0, 6)),
+            child: CustomPaint(painter: WeeklyPainter(days, start, progress, selectedDay, text, Theme.of(context).colorScheme.surfaceContainerHighest)),
+          ))),
+        ]))),
+      ]));
+  }
+}
+class DonutPainter extends CustomPainter {
+  DonutPainter(this.values, this.progress, this.selected, this.track);
+  final List<double> values;
+  final double progress;
+  final int? selected;
+  final Color track;
+  @override
+  void paint(Canvas canvas, Size size) {
+    final center = size.center(Offset.zero);
+    final rect = Rect.fromCircle(center: center, radius: 91);
+    canvas.drawCircle(center, 91, Paint()..color = track..style = PaintingStyle.stroke..strokeWidth = 24);
+    final total = values.fold(0.0, (a,b) => a+b);
+    if (total == 0) { return; }
+    var start = -math.pi / 2;
+    for (var i = 0; i < values.length; i++) {
+      final sweep = values[i] / total * math.pi * 2 * progress;
+      if (sweep > 0) { canvas.drawArc(rect, start, math.max(0, sweep - .025), false,
+        Paint()..color = categoryColors[i]..style = PaintingStyle.stroke..strokeWidth = (selected == i ? 32 : 24)); }
+      start += sweep;
+    }
+  }
+  @override
+  bool shouldRepaint(covariant DonutPainter old) => true;
+}
+class WeeklyPainter extends CustomPainter {
+  WeeklyPainter(this.values, this.start, this.progress, this.selected, this.textColor, this.track);
+  final List<double> values;
+  final DateTime start;
+  final double progress;
+  final int? selected;
+  final Color textColor, track;
+  @override
+  void paint(Canvas canvas, Size size) {
+    final maxValue = math.max(1.0, values.reduce(math.max));
+    final cell = size.width / 7, height = size.height - 48;
+    for (var i = 0; i < 7; i++) {
+      final x = cell * i + cell * .26, width = cell * .48;
+      canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(x, 6, width, height), const Radius.circular(7)), Paint()..color = track);
+      final h = values[i] / maxValue * height * progress;
+      if (h > 0) { canvas.drawRRect(RRect.fromRectAndRadius(Rect.fromLTWH(x, height + 6 - h, width, h), const Radius.circular(7)),
+        Paint()..color = selected == i ? const Color(0xffe3a444) : categoryColors.first); }
+      final d = DateTime(start.year, start.month, start.day + i);
+      final label = TextPainter(text: TextSpan(text: '${d.day}/${d.month}', style: TextStyle(color: textColor, fontSize: 11)), textDirection: TextDirection.ltr)..layout();
+      label.paint(canvas, Offset(cell * i + (cell - label.width) / 2, height + 20));
+    }
+  }
+  @override
+  bool shouldRepaint(covariant WeeklyPainter old) => true;
+}
+
+class ReviewScreen extends ConsumerStatefulWidget {
+  const ReviewScreen({super.key, this.imagePath, this.ocr, this.existing});
+  final String? imagePath;
+  final OcrResult? ocr;
+  final Expense? existing;
+  @override
+  ConsumerState<ReviewScreen> createState() => _ReviewScreenState();
+}
+class _ReviewScreenState extends ConsumerState<ReviewScreen> {
+  final _form = GlobalKey<FormState>();
+  late final TextEditingController _merchant, _amount, _note;
+  late final ParsedReceipt _parsed;
+  DateTime? _date;
+  ExpenseCategory _category = ExpenseCategory.food;
+  bool _confirmed = false, _saving = false, _boxes = true;
+  @override
+  void initState() {
+    super.initState();
+    _parsed = ReceiptParser().parse(widget.ocr?.text ?? '');
+    final e = widget.existing;
+    _merchant = TextEditingController(text: e?.merchant ?? _parsed.merchant);
+    _amount = TextEditingController(text: (e?.amount ?? _parsed.amount)?.toString() ?? '');
+    _note = TextEditingController(text: e?.note ?? '');
+    _date = e?.date ?? _parsed.date;
+    _category = e?.category ?? ExpenseCategory.food;
+  }
+  @override
+  void dispose() { _merchant.dispose(); _amount.dispose(); _note.dispose(); super.dispose(); }
+  Future<void> _save() async {
+    if (_saving || !_form.currentState!.validate()) { return; }
+    if (_date == null || !_confirmed) {
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Chọn ngày và xác nhận đã kiểm tra thông tin.'))); return;
+    }
+    setState(() => _saving = true);
+    StoredReceipt? stored;
+    final storage = ReceiptStorage();
+    try {
+      if (widget.existing == null && widget.imagePath != null) { stored = await storage.persist(widget.imagePath!); }
+      final expense = Expense(id: widget.existing?.id, merchant: _merchant.text.trim(),
+        amount: ReceiptParser.parseVnd(_amount.text)!, date: _date!, category: _category,
+        imagePath: stored?.image ?? widget.existing?.imagePath,
+        thumbnailPath: stored?.thumbnail ?? widget.existing?.thumbnailPath,
+        rawText: widget.ocr?.text ?? widget.existing?.rawText ?? '', note: _note.text.trim());
+      // A database commit is the boundary. Never remove its receipt on a later refresh error.
+      await ref.read(repositoryProvider).save(expense);
+      stored = null;
+      try { await ref.read(expensesProvider.notifier).refresh(); }
+      catch (_) { ref.invalidate(expensesProvider); }
+      if (mounted) { Navigator.pop(context, true); }
+    } catch (e) {
+      if (stored != null) { await storage.cleanup(stored); }
+      if (mounted) { ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Không thể hoàn tất: $e'))); }
+    } finally { if (mounted) { setState(() => _saving = false); } }
+  }
+  @override
+  Widget build(BuildContext context) {
+    final path = widget.imagePath ?? widget.existing?.imagePath;
+    final raw = widget.ocr?.text ?? widget.existing?.rawText ?? '';
+    return PopScope(canPop: !_saving, child: Scaffold(
+      appBar: AppBar(title: Text(widget.existing != null ? 'Sửa giao dịch' : path == null ? 'Thêm chi tiêu' : 'Kiểm tra hóa đơn')),
+      body: SingleChildScrollView(padding: const EdgeInsets.all(20), child: Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 640),
+        child: Form(key: _form, child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          if (path != null) ...[
+            ReceiptPreview(path: path, ocr: widget.ocr, showBoxes: _boxes),
+            if (widget.ocr != null) SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text('Hiển thị vùng chữ OCR'),
+              subtitle: Text('Nhận diện: ${widget.ocr!.elapsed.inMilliseconds} ms'), value: _boxes, onChanged: (v) => setState(() => _boxes = v)),
+            const SizedBox(height: 16),
+          ],
+          if (widget.ocr != null) ...[
+            Card(color: Theme.of(context).colorScheme.tertiaryContainer, child: Padding(padding: const EdgeInsets.all(16),
+              child: Text(['OCR có thể sai. Đối chiếu tên, tổng tiền và ngày với ảnh.', ..._parsed.warnings].join('\n')))),
+            const SizedBox(height: 20),
+          ],
+          TextFormField(key: const Key('merchant'), controller: _merchant, enabled: !_saving,
+            decoration: const InputDecoration(labelText: 'Tên cửa hàng', prefixIcon: Icon(Icons.storefront)),
+            validator: (v) => v == null || v.trim().isEmpty ? 'Nhập tên cửa hàng' : null),
+          const SizedBox(height: 16),
+          TextFormField(key: const Key('amount'), controller: _amount, enabled: !_saving, keyboardType: TextInputType.number,
+            decoration: const InputDecoration(labelText: 'Tổng tiền (VND)', prefixIcon: Icon(Icons.payments_outlined)),
+            validator: (v) => ReceiptParser.parseVnd(v ?? '') == null ? 'Nhập số tiền từ 1 đến 1.000.000.000 đ' : null),
+          if (_parsed.candidates.isNotEmpty && widget.existing == null) Padding(padding: const EdgeInsets.only(top: 10), child: Wrap(spacing: 8,
+            children: _parsed.candidates.take(5).map((c) => ActionChip(label: Text(money(c.amount)), tooltip: c.line,
+              onPressed: _saving ? null : () => setState(() => _amount.text = c.amount.toString()))).toList())),
+          const SizedBox(height: 16),
+          OutlinedButton.icon(key: const Key('date'), onPressed: _saving ? null : () async {
+            final picked = await showDatePicker(context: context, initialDate: _date ?? DateTime.now(), firstDate: DateTime(2000), lastDate: DateTime(2100, 12, 31));
+            if (picked != null && mounted) { setState(() => _date = picked); }
+          }, icon: const Icon(Icons.calendar_today), label: Text(_date == null ? 'Chọn ngày giao dịch *' : shortDate(_date!))),
+          const SizedBox(height: 16),
+          DropdownButtonFormField<ExpenseCategory>(initialValue: _category, decoration: const InputDecoration(labelText: 'Danh mục'),
+            items: ExpenseCategory.values.map((c) => DropdownMenuItem(value: c, child: Text(c.label))).toList(),
+            onChanged: _saving ? null : (c) => setState(() => _category = c!)),
+          const SizedBox(height: 16),
+          TextFormField(controller: _note, enabled: !_saving, decoration: const InputDecoration(labelText: 'Ghi chú (tùy chọn)'), maxLines: 2),
+          if (raw.isNotEmpty) Padding(padding: const EdgeInsets.only(top: 16), child: ExpansionTile(title: const Text('Văn bản OCR gốc'),
+            children: [Padding(padding: const EdgeInsets.all(12), child: SelectableText(raw))])),
+          CheckboxListTile(key: const Key('confirm'), value: _confirmed, contentPadding: EdgeInsets.zero,
+            title: const Text('Tôi đã kiểm tra tên, tổng tiền và ngày.'),
+            controlAffinity: ListTileControlAffinity.leading, onChanged: _saving ? null : (v) => setState(() => _confirmed = v ?? false)),
+          const SizedBox(height: 12),
+          SizedBox(width: double.infinity, child: FilledButton.icon(key: const Key('save'), onPressed: _saving ? null : _save,
+            icon: _saving ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2)) : const Icon(Icons.check_rounded),
+            label: Text(_saving ? 'Đang lưu...' : 'Xác nhận và lưu'))),
+          const SizedBox(height: 24),
+        ]))))),
+    ));
+  }
+}
+
+class HomeScreen extends ConsumerStatefulWidget {
+  const HomeScreen({super.key});
+  @override
+  ConsumerState<HomeScreen> createState() => _HomeScreenState();
+}
+class _HomeScreenState extends ConsumerState<HomeScreen> {
+  int _tab = 0;
+  ExpenseCategory? _category;
+  String _search = '';
+  Future<void> _delete(Expense expense) async {
+    final yes = await showDialog<bool>(context: context, builder: (context) => AlertDialog(
+      title: const Text('Xóa giao dịch?'), content: Text('${expense.merchant} • ${money(expense.amount)}\nẢnh hóa đơn cũng sẽ bị xóa khỏi bộ nhớ ứng dụng.'),
+      actions: [TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('Hủy')),
+        FilledButton(onPressed: () => Navigator.pop(context, true), child: const Text('Xóa'))]));
+    if (yes != true) { return; }
+    try { await ref.read(expensesProvider.notifier).delete(expense); }
+    catch (e) { if (mounted) { ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Không thể xóa: $e'))); } }
+  }
+  Future<void> _add() async {
+    final scan = await showModalBottomSheet<bool>(context: context, showDragHandle: true, builder: (context) => SafeArea(child: Padding(padding: const EdgeInsets.fromLTRB(16, 0, 16, 24), child: Column(mainAxisSize: MainAxisSize.min, children: [
+      ListTile(leading: const Icon(Icons.document_scanner_outlined), title: const Text('Quét hóa đơn'), subtitle: const Text('Chụp ảnh hoặc chọn từ thư viện'), onTap: () => Navigator.pop(context, true)),
+      ListTile(leading: const Icon(Icons.edit_note), title: const Text('Nhập thủ công'), subtitle: const Text('Thêm chi tiêu không có hóa đơn'), onTap: () => Navigator.pop(context, false)),
+    ]))));
+    if (scan == null || !mounted) { return; }
+    await Navigator.push(context, MaterialPageRoute(builder: (_) => scan ? const CaptureScreen() : const ReviewScreen()));
+  }
+  @override
+  Widget build(BuildContext context) {
+    final state = ref.watch(expensesProvider);
+    final dark = Theme.of(context).brightness == Brightness.dark;
+    return Scaffold(appBar: AppBar(title: Row(children: [
+      Container(padding: const EdgeInsets.all(8), decoration: BoxDecoration(color: Theme.of(context).colorScheme.primary, borderRadius: BorderRadius.circular(12)),
+        child: Icon(Icons.receipt_long_rounded, color: Theme.of(context).colorScheme.onPrimary)),
+      const SizedBox(width: 12), const Text('Receipt Lens', style: TextStyle(fontWeight: FontWeight.w700)),
+    ]), actions: [IconButton(key: const Key('theme'), tooltip: dark ? 'Chế độ sáng' : 'Chế độ tối',
+      onPressed: () => ref.read(themeProvider.notifier).toggle(dark), icon: Icon(dark ? Icons.light_mode_outlined : Icons.dark_mode_outlined))]),
+    body: state.when(loading: () => const Center(child: CircularProgressIndicator()), error: (error, stack) => Center(child: Padding(padding: const EdgeInsets.all(24), child: Column(mainAxisSize: MainAxisSize.min, children: [
+      Text('Không tải được dữ liệu: $error', textAlign: TextAlign.center),
+      TextButton(onPressed: () => ref.invalidate(expensesProvider), child: const Text('Thử lại')),
+    ]))), data: (expenses) {
+      final total = expenses.fold(0, (sum, e) => sum + e.amount);
+      final month = DateTime.now();
+      final monthTotal = expenses.where((e) => e.date.year == month.year && e.date.month == month.month).fold(0, (sum, e) => sum + e.amount);
+      final filtered = expenses.where((e) => (_category == null || e.category == _category) &&
+        ('${e.merchant} ${e.note}'.toLowerCase().contains(_search.toLowerCase()))).toList();
+      return RefreshIndicator(onRefresh: () => ref.read(expensesProvider.notifier).refresh(), child: ListView(
+        physics: const AlwaysScrollableScrollPhysics(), padding: const EdgeInsets.fromLTRB(20, 12, 20, 100), children: [
+          Center(child: ConstrainedBox(constraints: const BoxConstraints(maxWidth: 720), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text(_tab == 0 ? 'Chi tiêu trong tầm tay' : 'Lịch sử giao dịch', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.w700)),
+            const SizedBox(height: 8),
+            Text(_tab == 0 ? 'Quét hóa đơn, kiểm tra và lưu ngay trên thiết bị.' : '${expenses.length} giao dịch • Tổng ${money(total)}', style: Theme.of(context).textTheme.bodyMedium),
+            const SizedBox(height: 20),
+            if (_tab == 0) ...[
+              Container(width: double.infinity, padding: const EdgeInsets.all(24), decoration: BoxDecoration(borderRadius: BorderRadius.circular(24),
+                gradient: const LinearGradient(colors: [Color(0xff116c60), Color(0xff179c80)], begin: Alignment.topLeft, end: Alignment.bottomRight)),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Text('THÁNG ${month.month}/${month.year}', style: const TextStyle(color: Colors.white70, fontWeight: FontWeight.w600, letterSpacing: 1.2)),
+                  const SizedBox(height: 12), Text(money(monthTotal), style: const TextStyle(color: Colors.white, fontSize: 32, fontWeight: FontWeight.w700)),
+                  const SizedBox(height: 12), const Row(children: [Icon(Icons.lock_outline, size: 16, color: Colors.white70), SizedBox(width: 6), Text('Dữ liệu được lưu trên thiết bị', style: TextStyle(color: Colors.white70))]),
+                ])),
+              const SizedBox(height: 20), ExpenseCharts(expenses: expenses), const SizedBox(height: 24),
+              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [Text('Giao dịch gần đây', style: Theme.of(context).textTheme.titleLarge), TextButton(onPressed: () => setState(() => _tab = 1), child: const Text('Xem tất cả'))]),
+            ] else ...[
+              TextField(key: const Key('search'), decoration: const InputDecoration(hintText: 'Tìm cửa hàng hoặc ghi chú', prefixIcon: Icon(Icons.search)), onChanged: (v) => setState(() => _search = v)),
+              const SizedBox(height: 14),
+              Wrap(spacing: 6, runSpacing: 6, children: [ChoiceChip(label: const Text('Tất cả'), selected: _category == null, onSelected: (_) => setState(() => _category = null)),
+                ...ExpenseCategory.values.map((c) => ChoiceChip(label: Text(c.label), selected: _category == c, onSelected: (_) => setState(() => _category = _category == c ? null : c)))]),
+              const SizedBox(height: 16),
+            ],
+            if ((_tab == 0 ? expenses : filtered).isEmpty) Card(child: Padding(padding: const EdgeInsets.all(28), child: Center(child: Column(children: [
+              Icon(Icons.receipt_long_outlined, size: 48, color: Theme.of(context).colorScheme.primary), const SizedBox(height: 12),
+              Text(expenses.isEmpty ? 'Chưa có giao dịch' : 'Không có kết quả phù hợp', style: Theme.of(context).textTheme.titleMedium),
+              if (expenses.isEmpty) ...[const SizedBox(height: 8), const Text('Bắt đầu bằng một hóa đơn hoặc nhập thủ công.', textAlign: TextAlign.center)],
+            ]))))
+            else ...(_tab == 0 ? expenses.take(5) : filtered).map((e) => Padding(padding: const EdgeInsets.only(bottom: 10), child: Card(child: ListTile(
+              contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+              leading: SizedBox(width: 48, height: 48, child: e.thumbnailPath == null ? _categoryIcon(e) : ClipRRect(borderRadius: BorderRadius.circular(12),
+                child: _categoryIcon(e))),
+              title: Text(e.merchant, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w600)),
+              subtitle: Text('${e.category.label} • ${shortDate(e.date)}'),
+              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => ReviewScreen(existing: e))),
+              trailing: Row(mainAxisSize: MainAxisSize.min, children: [Text(money(e.amount), style: const TextStyle(fontWeight: FontWeight.w600)),
+                PopupMenuButton<String>(tooltip: 'Thao tác', onSelected: (action) { if (action == 'delete') { _delete(e); } else { Navigator.push(context, MaterialPageRoute(builder: (_) => ReviewScreen(existing: e))); } },
+                  itemBuilder: (_) => const [PopupMenuItem(value: 'edit', child: Text('Sửa')), PopupMenuItem(value: 'delete', child: Text('Xóa'))]),
+              ]),
+            )))),
+          ]))),
+        ]));
+    }),
+    floatingActionButton: FloatingActionButton.extended(key: const Key('add'), onPressed: _add, icon: const Icon(Icons.add), label: const Text('Thêm chi tiêu')),
+    bottomNavigationBar: NavigationBar(selectedIndex: _tab, onDestinationSelected: (i) => setState(() => _tab = i), destinations: const [
+      NavigationDestination(icon: Icon(Icons.donut_large_outlined), selectedIcon: Icon(Icons.donut_large), label: 'Tổng quan'),
+      NavigationDestination(icon: Icon(Icons.receipt_long_outlined), selectedIcon: Icon(Icons.receipt_long), label: 'Giao dịch'),
+    ]),
+    );
+  }
+  Widget _categoryIcon(Expense e) => Container(decoration: BoxDecoration(color: categoryColors[e.category.index].withValues(alpha: .13), borderRadius: BorderRadius.circular(12)),
+    child: Icon(categoryIcons[e.category.index], color: categoryColors[e.category.index]));
+}
+
+
+void main() {
+  final now=DateTime.now();
+  final repository=ExpenseRepository();
+  repository.records.addAll([
+    Expense(id:1, merchant:'WinMart',amount:150000,date:DateTime(now.year,now.month,now.day),category:ExpenseCategory.food),
+    Expense(id:2, merchant:'Nhà sách Phương Nam',amount:85000,date:DateTime(now.year,now.month,now.day-1),category:ExpenseCategory.study),
+    Expense(id:3, merchant:'Grab',amount:42000,date:DateTime(now.year,now.month,now.day-2),category:ExpenseCategory.travel),
+    Expense(id:4, merchant:'CGV Cinema',amount:95000,date:DateTime(now.year,now.month,now.day-3),category:ExpenseCategory.entertainment),
+    Expense(id:5, merchant:'Đồ dùng học tập',amount:58000,date:DateTime(now.year,now.month,now.day-4),category:ExpenseCategory.gear),
+  ]);
+  runApp(ProviderScope(overrides:[preferencesProvider.overrideWithValue(SharedPreferences()),repositoryProvider.overrideWithValue(repository)],child:const BrowserPreviewApp()));
+}
+class BrowserPreviewApp extends ConsumerWidget {
+  const BrowserPreviewApp({super.key});
+  @override Widget build(BuildContext c,WidgetRef ref) => MaterialApp(debugShowCheckedModeBanner:false,
+    theme:appTheme(Brightness.light),darkTheme:appTheme(Brightness.dark),themeMode:ref.watch(themeProvider),
+    home:Uri.base.queryParameters['screen']=='review'
+      ? ReviewScreen(existing:Expense(id:1,merchant:'WinMart',amount:150000,date:DateTime.now(),category:ExpenseCategory.food))
+      : const HomeScreen());
+}

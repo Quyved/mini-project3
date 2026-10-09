@@ -1,0 +1,33 @@
+.dart_tool/
+.flutter-plugins*
+.packages
+build/
+coverage/
+android/.gradle/
+android/local.properties
+android/key.properties
+android/app/*.jks
+android/app/*.keystore
+*.iml
+.idea/
+.local-cache/
+.DS_Store
+
+**/GeneratedPluginRegistrant.java
+
+# Signing & Keystores (Strictly ignored)
+*.jks
+*.keystore
+*.p12
+*.key
+*.pem
+key.properties
+**/key.properties
+upload-keystore.jks
+
+# Binaries & APKs
+*.apk
+releases/*.apk
+android/build/
+android/.cxx/
+

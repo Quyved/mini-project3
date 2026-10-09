@@ -1,0 +1,31 @@
+name: receipt_lens
+description: Offline OCR expense tracker for VKU Mini-Project 3.
+publish_to: none
+version: 1.0.0+1
+environment:
+  sdk: '>=3.12.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  camera: ^0.12.1
+  image_picker: ^1.2.1
+  image_cropper: ^12.2.1
+  google_mlkit_text_recognition: ^0.17.1
+  flutter_riverpod: ^3.4.3
+  sqflite: ^2.4.2
+  path: ^1.9.1
+  path_provider: ^2.1.5
+  image: ^4.5.4
+  intl: ^0.20.2
+  shared_preferences: ^2.5.3
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  sqflite_common_ffi: ^2.3.6
+flutter:
+  uses-material-design: true
